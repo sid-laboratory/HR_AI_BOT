@@ -1,18 +1,17 @@
 from fastapi import FastAPI, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-
+import speech_recognition as sr
+from pydub import AudioSegment
 from dotenv import load_dotenv
-
-import openai
 import os
 import json
 import requests
+import time
 
 load_dotenv()
 
-openai.api_key = os.getenv("OPEN_AI_KEY")
-openai.organization = os.getenv("OPEN_AI_ORG")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 elevenlabs_key = os.getenv("ELEVENLABS_KEY")
 
 app = FastAPI()
@@ -28,65 +27,91 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
-
 @app.post("/talk")
 async def post_audio(file: UploadFile):
-    user_message = transcribe_audio(file)
-    chat_response = get_chat_response(user_message)
+    user_message = await transcribe_audio(file)
+    print(f"DEBUG: Transcribed audio: {user_message['text']}")
+    
+    chat_response, response_time = get_chat_response(user_message["text"])
+    print(f"DEBUG: Groq Response: {chat_response}")
+    
     audio_output = text_to_speech(chat_response)
-
+    
+    if audio_output is None:
+        return {"error": "Failed to generate audio response."}
+    
     def iterfile():
-        yield audio_output
-
-    return StreamingResponse(iterfile(), media_type="application/octet-stream")
+        for chunk in audio_output.iter_content(chunk_size=1024):
+            yield chunk
+    
+    return StreamingResponse(iterfile(), media_type="audio/mpeg")
 
 @app.get("/clear")
 async def clear_history():
     file = 'database.json'
-    open(file, 'w')
+    open(file, 'w').close()
     return {"message": "Chat history has been cleared"}
 
-# Functions
-def transcribe_audio(file):
-    # Save the blob first
-    with open(file.filename, 'wb') as buffer:
-        buffer.write(file.file.read())
-    audio_file = open(file.filename, "rb")
-    transcript = openai.Audio.transcribe("whisper-1", audio_file)
-    print(transcript)
-    return transcript
+async def transcribe_audio(file: UploadFile):
+    audio_path = "temp_audio.wav"
+    with open(audio_path, 'wb') as buffer:
+        buffer.write(await file.read())
+
+    audio = AudioSegment.from_file(audio_path)
+    audio.export(audio_path, format="wav")
+
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_path) as source:
+        audio_data = recognizer.record(source)
+
+    try:
+        transcript = recognizer.recognize_google(audio_data)
+        return {"text": transcript}
+    except sr.UnknownValueError:
+        return {"text": "Could not understand the audio"}
+    except sr.RequestError:
+        return {"text": "Speech recognition request failed"}
 
 def get_chat_response(user_message):
     messages = load_messages()
-    messages.append({"role": "user", "content": user_message['text']})
+    messages.append({"role": "user", "content": user_message})
 
-    # Send to ChatGpt/OpenAi
-    gpt_response = gpt_response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=messages
-        )
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "llama3-8b-8192",
+        "messages": messages
+    }
 
-    parsed_gpt_response = gpt_response['choices'][0]['message']['content']
-
-    # Save messages
-    save_messages(user_message['text'], parsed_gpt_response)
-
-    return parsed_gpt_response
+    start_time = time.time()
+    response = requests.post(url, headers=headers, json=data)
+    response_time = time.time() - start_time
+    
+    try:
+        gpt_response = response.json()
+        if "choices" in gpt_response and gpt_response["choices"]:
+            parsed_gpt_response = gpt_response['choices'][0]['message']['content']
+        else:
+            parsed_gpt_response = "I'm sorry, I couldn't process that request."
+    except (json.JSONDecodeError, KeyError):
+        parsed_gpt_response = "Error processing response from the AI."
+    
+    save_messages(user_message, parsed_gpt_response)
+    print(f"Groq response time: {response_time:.2f} seconds")
+    return parsed_gpt_response, response_time
 
 def load_messages():
     messages = []
     file = 'database.json'
 
-    empty = os.stat(file).st_size == 0
-
-    if not empty:
+    if os.path.exists(file) and os.stat(file).st_size > 0:
         with open(file) as db_file:
             data = json.load(db_file)
             for item in data:
@@ -128,16 +153,12 @@ def text_to_speech(text):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
     try:
-        response = requests.post(url, json=body, headers=headers)
+        response = requests.post(url, json=body, headers=headers, stream=True)
         if response.status_code == 200:
-            return response.content
+            return response
         else:
-            print('something went wrong')
+            print(f"Error: {response.status_code}, Response: {response.text}")
+            return None
     except Exception as e:
-        print(e)
-
-
-#1. Send in audio, and have it transcribed
-#2. We want to send it to chatgpt and get a response
-#3. We want to save the chat history to send back and forth for context.
-
+        print(f"Exception in text_to_speech: {e}")
+        return None
