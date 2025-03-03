@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import speech_recognition as sr
 from pydub import AudioSegment
 from dotenv import load_dotenv
+import pyttsx3
 import os
 import json
 import requests
@@ -12,7 +13,6 @@ import time
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-elevenlabs_key = os.getenv("ELEVENLABS_KEY")
 
 app = FastAPI()
 
@@ -35,20 +35,15 @@ app.add_middleware(
 async def post_audio(file: UploadFile):
     user_message = await transcribe_audio(file)
     print(f"DEBUG: Transcribed audio: {user_message['text']}")
-    
+
     chat_response, response_time = get_chat_response(user_message["text"])
     print(f"DEBUG: Groq Response: {chat_response}")
-    
-    audio_output = text_to_speech(chat_response)
-    
-    if audio_output is None:
-        return {"error": "Failed to generate audio response."}
-    
-    def iterfile():
-        for chunk in audio_output.iter_content(chunk_size=1024):
-            yield chunk
-    
-    return StreamingResponse(iterfile(), media_type="audio/mpeg")
+
+    save_messages(user_message["text"], chat_response)  # Save updated chat history
+
+    audio_file_path = text_to_speech(chat_response)
+
+    return StreamingResponse(open(audio_file_path, "rb"), media_type="audio/mpeg")
 
 @app.get("/clear")
 async def clear_history():
@@ -93,72 +88,45 @@ def get_chat_response(user_message):
     start_time = time.time()
     response = requests.post(url, headers=headers, json=data)
     response_time = time.time() - start_time
-    
+
+    parsed_gpt_response = "Error processing response from the AI."  # Default fallback
+
     try:
         gpt_response = response.json()
         if "choices" in gpt_response and gpt_response["choices"]:
             parsed_gpt_response = gpt_response['choices'][0]['message']['content']
-        else:
-            parsed_gpt_response = "I'm sorry, I couldn't process that request."
     except (json.JSONDecodeError, KeyError):
         parsed_gpt_response = "Error processing response from the AI."
-    
+
     save_messages(user_message, parsed_gpt_response)
     print(f"Groq response time: {response_time:.2f} seconds")
-    return parsed_gpt_response, response_time
+    
+    return parsed_gpt_response, response_time  # Ensure always two values returned
+
 
 def load_messages():
-    messages = []
     file = 'database.json'
-
     if os.path.exists(file) and os.stat(file).st_size > 0:
         with open(file) as db_file:
-            data = json.load(db_file)
-            for item in data:
-                messages.append(item)
+            return json.load(db_file)  # Load full history
     else:
-        messages.append(
-            {"role": "system", "content": "You are interviewing the user for a front-end React developer position. Ask short questions that are relevant to a junior level developer. Your name is Greg. The user is Travis. Keep responses under 30 words and be funny sometimes."}
-        )
-    return messages
+        return [{"role": "system", "content": "You are interviewing the user for a front-end React developer position and his name is Sid. Ask short questions relevant to a junior-level developer. Keep responses under 30 words and be strict with grading."}]
 
 def save_messages(user_message, gpt_response):
     file = 'database.json'
-    messages = load_messages()
-    messages.append({"role": "user", "content": user_message})
-    messages.append({"role": "assistant", "content": gpt_response})
+    messages = load_messages()  # Load existing history
+    messages.append({"role": "user", "content": user_message})  # Append new user input
+    messages.append({"role": "assistant", "content": gpt_response})  # Append AI response
     with open(file, 'w') as f:
-        json.dump(messages, f)
+        json.dump(messages, f)  # Save full conversation history
 
 def text_to_speech(text):
-    voice_id = 'pNInz6obpgDQGcFmaJgB'
-    
-    body = {
-        "text": text,
-        "model_id": "eleven_monolingual_v1",
-        "voice_settings": {
-            "stability": 0,
-            "similarity_boost": 0,
-            "style": 0.5,
-            "use_speaker_boost": True
-        }
-    }
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 150)  # Adjust speed (default ~200)
+    engine.setProperty('volume', 1.0)  # Max volume
+    audio_path = "response_audio.mp3"
 
-    headers = {
-        "Content-Type": "application/json",
-        "accept": "audio/mpeg",
-        "xi-api-key": elevenlabs_key
-    }
+    engine.save_to_file(text, audio_path)
+    engine.runAndWait()
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-
-    try:
-        response = requests.post(url, json=body, headers=headers, stream=True)
-        if response.status_code == 200:
-            return response
-        else:
-            print(f"Error: {response.status_code}, Response: {response.text}")
-            return None
-    except Exception as e:
-        print(f"Exception in text_to_speech: {e}")
-        return None
+    return audio_path
